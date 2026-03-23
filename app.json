@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "PromptVault AI",
+    "slug": "PromptValtAI",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "icon": "./assets/icon.png",
+    "ios": {
+      "supportsTablet": true,
+      "buildNumber": "15",
+      "bundleIdentifier": "com.valdemir.promptvault",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "web": {
+      "bundler": "metro",
+      "dangerous": {
+        "contentSecurityPolicy": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline';"
+      }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "97407b94-cb7d-4507-8b3e-a008f9e97be3"
+      }
+    }
+  }
+}
