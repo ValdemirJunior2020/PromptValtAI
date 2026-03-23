@@ -3,10 +3,7 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-const admin = require("firebase-admin");
 const OpenAI = require("openai");
-const fs = require("fs");
-const path = require("path");
 
 const app = express();
 
@@ -19,168 +16,99 @@ app.use(
 );
 app.use(express.json());
 
-function loadServiceAccount() {
-  const firebasePath = path.join(__dirname, "firebase.json");
-
-  if (!fs.existsSync(firebasePath)) {
-    throw new Error(`firebase.json not found at ${firebasePath}`);
-  }
-
-  return require("./firebase.json");
-}
-
-const serviceAccount = loadServiceAccount();
-
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-}
-
-const db = admin.firestore();
 const OpenAIClient = OpenAI.default ?? OpenAI;
 const openai = new OpenAIClient({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-async function verifyFirebaseToken(req, res, next) {
-  try {
-    const authHeader = req.headers.authorization || "";
-    const token = authHeader.startsWith("Bearer ")
-      ? authHeader.slice(7).trim()
-      : "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const DEFAULT_CREDITS = 3;
+const creditsStore = new Map();
 
-    console.log("verifyFirebaseToken -> token length:", token.length);
+function getUserKey(req) {
+  const raw =
+    req.headers["x-user-id"] ||
+    req.body?.userId ||
+    req.query?.userId ||
+    "guest";
+  return String(raw).trim() || "guest";
+}
 
-    if (!token) {
-      return res.status(401).json({ error: "No token provided" });
-    }
-
-    const decodedToken = await admin.auth().verifyIdToken(token);
-    console.log("verifyFirebaseToken -> uid:", decodedToken.uid);
-
-    req.user = decodedToken;
-    next();
-  } catch (error) {
-    console.error("verifyFirebaseToken error:", error);
-    return res.status(401).json({
-      error: "Invalid Firebase ID token",
-      details: error.message,
-    });
+function getCredits(userId) {
+  if (!creditsStore.has(userId)) {
+    creditsStore.set(userId, DEFAULT_CREDITS);
   }
+  return creditsStore.get(userId);
+}
+
+function setCredits(userId, value) {
+  creditsStore.set(userId, value);
+  return value;
 }
 
 app.get("/", (_req, res) => {
   res.send("🚀 PromptVault API is running!");
 });
 
-app.get("/health", async (_req, res) => {
-  try {
-    await db.collection("_health").limit(1).get();
-    return res.json({ ok: true, firestore: true });
-  } catch (error) {
-    console.error("/health firestore error:", error);
-    return res.status(500).json({
-      ok: false,
-      firestore: false,
-      error: error.message,
-    });
-  }
-});
-
-app.get("/api/debug-auth", verifyFirebaseToken, async (req, res) => {
-  return res.json({
+app.get("/health", (_req, res) => {
+  res.json({
     ok: true,
-    uid: req.user.uid,
-    email: req.user.email || null,
+    model: OPENAI_MODEL,
+    authMode: "temporary-no-firebase-admin",
   });
 });
 
-app.get("/api/debug-firestore", verifyFirebaseToken, async (req, res) => {
+app.get("/api/credits", (req, res) => {
   try {
-    const ref = db.collection("users").doc(req.user.uid);
-    const snap = await ref.get();
+    const userId = getUserKey(req);
+    const credits = getCredits(userId);
 
-    return res.json({
-      ok: true,
-      exists: snap.exists,
-      data: snap.exists ? snap.data() : null,
-    });
-  } catch (error) {
-    console.error("/api/debug-firestore error:", error);
-    return res.status(500).json({
-      ok: false,
-      where: "debug-firestore",
-      error: error.message,
-      code: error.code || null,
-    });
-  }
-});
+    console.log("GET /api/credits ->", { userId, credits });
 
-app.get("/api/credits", verifyFirebaseToken, async (req, res) => {
-  try {
-    const uid = req.user.uid;
-    const userRef = db.collection("users").doc(uid);
-    const userDoc = await userRef.get();
-
-    let credits = 3;
-
-    if (!userDoc.exists) {
-      await userRef.set({ credits: 3 }, { merge: true });
-      credits = 3;
-    } else {
-      credits = Number(userDoc.data()?.credits ?? 3);
-      if (Number.isNaN(credits)) credits = 3;
-    }
-
-    console.log("/api/credits ->", uid, credits);
     return res.json({ credits });
   } catch (error) {
-    console.error("/api/credits error:", error);
+    console.error("❌ /api/credits error:", error);
     return res.status(500).json({
-      error: error.message,
-      code: error.code || null,
-      where: "/api/credits",
+      error: error.message || "Failed to load credits",
     });
   }
 });
 
-app.post("/api/generate", verifyFirebaseToken, async (req, res) => {
+app.post("/api/generate", async (req, res) => {
   try {
+    const userId = getUserKey(req);
     const prompt = (req.body?.prompt || "").toString().trim();
+
+    console.log("POST /api/generate ->", {
+      userId,
+      promptLength: prompt.length,
+    });
 
     if (!prompt) {
       return res.status(400).json({ error: "Prompt is required" });
     }
 
-    const uid = req.user.uid;
-    const userRef = db.collection("users").doc(uid);
-    const userDoc = await userRef.get();
+    const currentCredits = getCredits(userId);
 
-    let currentCredits = 3;
-
-    if (!userDoc.exists) {
-      await userRef.set({ credits: 3 }, { merge: true });
-      currentCredits = 3;
-    } else {
-      currentCredits = Number(userDoc.data()?.credits ?? 0);
-      if (currentCredits <= 0) {
-        return res.status(403).json({
-          error: "Out of credits",
-          triggerPaywall: true,
-        });
-      }
+    if (currentCredits <= 0) {
+      return res.status(403).json({
+        error: "Out of credits",
+        triggerPaywall: true,
+      });
     }
 
     const completion = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      model: OPENAI_MODEL,
       messages: [
         {
           role: "system",
           content:
             "You are an elite Prompt Engineer. Only output the final engineered prompt. No explanations.",
         },
-        { role: "user", content: prompt },
+        {
+          role: "user",
+          content: prompt,
+        },
       ],
       max_tokens: 900,
     });
@@ -191,21 +119,47 @@ app.post("/api/generate", verifyFirebaseToken, async (req, res) => {
       return res.status(500).json({ error: "Empty response from model" });
     }
 
-    await userRef.set(
-      { credits: admin.firestore.FieldValue.increment(-1) },
-      { merge: true }
-    );
+    const creditsRemaining = setCredits(userId, currentCredits - 1);
+
+    console.log("✅ /api/generate success ->", {
+      userId,
+      creditsRemaining,
+    });
 
     return res.json({
       data: text,
-      creditsRemaining: currentCredits - 1,
+      creditsRemaining,
     });
   } catch (error) {
-    console.error("/api/generate error:", error);
+    console.error("❌ /api/generate error:", error);
     return res.status(500).json({
-      error: error.message,
-      code: error.code || null,
-      where: "/api/generate",
+      error: error.message || "Generation failed",
+    });
+  }
+});
+
+app.post("/api/purchase", (req, res) => {
+  try {
+    const userId = getUserKey(req);
+    const amount = Number(req.body?.amount || 0);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: "Valid amount is required" });
+    }
+
+    const currentCredits = getCredits(userId);
+    const credits = setCredits(userId, currentCredits + amount);
+
+    console.log("POST /api/purchase ->", { userId, amount, credits });
+
+    return res.json({
+      success: true,
+      credits,
+    });
+  } catch (error) {
+    console.error("❌ /api/purchase error:", error);
+    return res.status(500).json({
+      error: error.message || "Purchase failed",
     });
   }
 });

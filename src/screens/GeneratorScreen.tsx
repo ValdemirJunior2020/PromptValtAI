@@ -15,7 +15,7 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import { doc, deleteDoc } from "firebase/firestore";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   deleteUser,
   EmailAuthProvider,
@@ -35,10 +35,15 @@ import {
 } from "lucide-react-native";
 import * as Clipboard from "expo-clipboard";
 import { LinearGradient } from "expo-linear-gradient";
-import { auth, db } from "../lib/firebase";
+import { auth } from "../lib/firebase";
 
 const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || "https://promptvaltai.onrender.com";
+
+const buildUserId = () => {
+  const user = auth.currentUser;
+  return user?.uid || user?.email || "guest";
+};
 
 export default function GeneratorScreen() {
   const [prompt, setPrompt] = useState("");
@@ -67,20 +72,34 @@ export default function GeneratorScreen() {
     fetchInitialCredits();
   }, []);
 
-  const getToken = async () => {
-    const user = auth.currentUser;
-    if (!user) throw new Error("No logged in user");
-    const token = await user.getIdToken(true);
-    console.log("token length:", token.length);
-    return token;
+  const persistCreditsLocally = async (value: number) => {
+    try {
+      await AsyncStorage.setItem(
+        `promptvault_credits_${buildUserId()}`,
+        String(value)
+      );
+    } catch (error) {
+      console.log("local credit save failed:", error);
+    }
+  };
+
+  const getLocalCredits = async () => {
+    try {
+      const raw = await AsyncStorage.getItem(
+        `promptvault_credits_${buildUserId()}`
+      );
+      if (raw == null) return null;
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) ? parsed : null;
+    } catch (error) {
+      console.log("local credit load failed:", error);
+      return null;
+    }
   };
 
   const fetchJson = async (url: string, options: RequestInit) => {
     const response = await fetch(url, options);
     const raw = await response.text();
-    console.log("URL:", url);
-    console.log("STATUS:", response.status);
-    console.log("RAW:", raw);
 
     let data: any = {};
     try {
@@ -95,23 +114,30 @@ export default function GeneratorScreen() {
   const fetchInitialCredits = async () => {
     try {
       setIsFetchingCredits(true);
-      const token = await getToken();
 
-      const { response, data } = await fetchJson(`${API_BASE_URL}/api/credits`, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
+      const userId = buildUserId();
+      const { response, data } = await fetchJson(
+        `${API_BASE_URL}/api/credits?userId=${encodeURIComponent(userId)}`,
+        {
+          method: "GET",
+          headers: {
+            "x-user-id": userId,
+          },
+        }
+      );
 
       if (response.ok) {
-        setCredits(data.credits ?? 0);
+        const nextCredits = Number(data.credits ?? 0);
+        setCredits(nextCredits);
+        await persistCreditsLocally(nextCredits);
       } else {
-        setCredits("?");
+        const localCredits = await getLocalCredits();
+        setCredits(localCredits ?? "?");
         console.log("credits fetch failed:", data);
       }
     } catch (error: any) {
-      setCredits("?");
+      const localCredits = await getLocalCredits();
+      setCredits(localCredits ?? "?");
       console.log("credits fetch crash:", error?.message || error);
     } finally {
       setIsFetchingCredits(false);
@@ -146,8 +172,7 @@ export default function GeneratorScreen() {
       setIsLoading(true);
       setResult("");
 
-      const token = await getToken();
-
+      const userId = buildUserId();
       const finalPromptIdea = `Create a ${targetAI} prompt for: ${prompt}. ${
         activeStyle ? `Make the style: ${activeStyle}.` : ""
       }`;
@@ -156,16 +181,22 @@ export default function GeneratorScreen() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "x-user-id": userId,
         },
-        body: JSON.stringify({ prompt: finalPromptIdea }),
+        body: JSON.stringify({
+          userId,
+          prompt: finalPromptIdea,
+        }),
       });
 
       if (response.ok) {
+        const nextCredits = Number(data.creditsRemaining ?? credits);
         setResult(data.data || "");
-        setCredits(data.creditsRemaining ?? credits);
+        setCredits(nextCredits);
+        await persistCreditsLocally(nextCredits);
       } else if (response.status === 403) {
         setCredits(0);
+        await persistCreditsLocally(0);
         setShowPaywall(true);
         setResult(data?.error || "Out of credits.");
       } else {
@@ -179,14 +210,6 @@ export default function GeneratorScreen() {
     }
   };
 
-  const deleteUserData = async (uid: string) => {
-    try {
-      await deleteDoc(doc(db, "users", uid));
-    } catch (e: any) {
-      console.log("Firestore user doc deletion failed:", e?.message || e);
-    }
-  };
-
   const runAccountDeletion = async () => {
     const user = auth.currentUser;
     if (!user) return;
@@ -194,7 +217,6 @@ export default function GeneratorScreen() {
     setIsDeletingAccount(true);
 
     try {
-      await deleteUserData(user.uid);
       await deleteUser(user);
       Alert.alert("Account Deleted", "Your account has been permanently deleted.");
     } catch (err: any) {
@@ -213,7 +235,7 @@ export default function GeneratorScreen() {
     setShowAccountMenu(false);
     Alert.alert(
       "Delete your account?",
-      "This permanently deletes your account and removes your vault data. This cannot be undone.",
+      "This permanently deletes your account. This cannot be undone.",
       [
         { text: "Cancel", style: "cancel" },
         { text: "Delete", style: "destructive", onPress: runAccountDeletion },
